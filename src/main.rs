@@ -1,13 +1,24 @@
+use std::time::Duration;
+
 use anyhow::{anyhow, Result};
 use bytes::{Bytes, BytesMut};
 use clap::Parser;
+use flavors::parser::TagHeader;
 use log::{debug, info};
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use simplelog::*;
+use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::task;
+use tokio::time::sleep;
+use tokio::time::Instant;
 use url::Url;
+
+use crate::flv_reader::FlvReader;
+
+mod flv_reader;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -43,6 +54,31 @@ async fn connection_reader(
 
     info!("Reader disconnected");
     Ok(())
+}
+
+async fn read_file(
+    file: &str,
+    tags: mpsc::UnboundedSender<(Duration, TagHeader, Vec<u8>)>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Open the file
+    let file = File::open(file).await?;
+
+    let mut flv_reader = FlvReader::new(file);
+    let _header = flv_reader.read_header().await;
+
+    let start_time = Instant::now();
+    loop {
+        let (tag_header, tag_bytes) = flv_reader.read_tag().await?;
+        // Setup our baseline tag time
+        let current_tag_time = start_time + Duration::from_millis(tag_header.timestamp as u64);
+        let now = Instant::now();
+
+        if current_tag_time > now {
+            sleep(current_tag_time - now).await;
+        }
+
+        tags.send((current_tag_time - start_time, tag_header, tag_bytes))?;
+    }
 }
 
 #[tokio::main]
@@ -126,4 +162,27 @@ async fn main() -> Result<()> {
     tokio::task::spawn(async { connection_reader(stream_reader, read_bytes_sender).await });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use anyhow::Result;
+    use tokio::select;
+
+    #[tokio::test]
+    async fn test_file_read() -> Result<()> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<(Duration, TagHeader, Vec<u8>)>();
+        tokio::task::spawn(async {
+            let _ = read_file("ertmp-av1-av1-av1.flv", tx).await;
+        });
+
+        loop {
+            select! {
+                Some((duration, tag, data)) = rx.recv() => {
+                    println!("Duration: {:?} TagType: {:?}, Len {}", duration, tag.tag_type, data.len());
+                }
+            }
+        }
+    }
 }
