@@ -53,8 +53,6 @@ where
             .map(|(_, tag_size)| tag_size)
             .map_err(|e| anyhow!("{:#?}", e))?;
 
-        println!("Previous tag size: {}", prev_tag_size);
-
         // Decode tag header
         let header = match flv::tag_header(&tag[4..]) {
             Ok((_, header)) => Ok::<_, anyhow::Error>(header),
