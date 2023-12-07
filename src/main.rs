@@ -3,7 +3,7 @@ use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use flavors::parser::{TagHeader, TagType};
 use log::{debug, info, warn};
-use rml_amf0::Amf0Value;
+use rml_amf0::{deserialize, Amf0Value};
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use rml_rtmp::sessions::{
     ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult,
@@ -12,6 +12,7 @@ use rml_rtmp::sessions::{PublishRequestType, StreamMetadata};
 use rml_rtmp::time::RtmpTimestamp;
 use simplelog::*;
 use std::collections::{HashMap, VecDeque};
+use std::io::Cursor;
 use std::time::Duration;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
@@ -293,35 +294,6 @@ async fn main() -> Result<()> {
 
     info!("publish succeeded");
 
-    // send publish metadata
-    let mut meta = StreamMetadata::new();
-    meta.apply_metadata_values(HashMap::from([
-        ("audiochannels".to_string(), Amf0Value::Number(2f64)),
-        ("audiocodecid".to_string(), Amf0Value::Number(10f64)),
-        ("audiodatarate".to_string(), Amf0Value::Number(128f64)),
-        ("audiosamplerate".to_string(), Amf0Value::Number(48000f64)),
-        ("audiosamplesize".to_string(), Amf0Value::Number(16f64)),
-        ("duration".to_string(), Amf0Value::Number(0f64)),
-        ("fileSize".to_string(), Amf0Value::Number(0f64)),
-        ("framerate".to_string(), Amf0Value::Number(30f64)),
-        ("width".to_string(), Amf0Value::Number(1920f64)),
-        ("height".to_string(), Amf0Value::Number(1080f64)),
-        ("stereo".to_string(), Amf0Value::Boolean(true)),
-        ("2.1".to_string(), Amf0Value::Boolean(false)),
-        ("3.1".to_string(), Amf0Value::Boolean(false)),
-        ("4.0".to_string(), Amf0Value::Boolean(false)),
-        ("4.1".to_string(), Amf0Value::Boolean(false)),
-        ("5.1".to_string(), Amf0Value::Boolean(false)),
-        ("7.1".to_string(), Amf0Value::Boolean(false)),
-        (
-            "videocodecid".to_string(),
-            Amf0Value::Number(VIDEODATA_AV1VIDEOPACKET),
-        ), // av1
-        ("videodatarate".to_string(), Amf0Value::Number(6000f64)), // TODO set this
-    ]));
-    let action = session.publish_metadata(&meta)?;
-    handle_session_results(&mut stream_writer, &mut events, vec![action]).await?;
-
     // now we can enter "normal operation" mode, where we do a few things:
     // 1. send media data
     // 2. service incoming events from the server
@@ -348,8 +320,32 @@ async fn main() -> Result<()> {
                         TagType::Audio => {
                             let result = session.publish_audio_data(data.into(), timestamp, false)?;
                             handle_session_results(&mut stream_writer, &mut events, vec![result]).await?;
+                        },
+                        _ => {
+                            let mut cursor = Cursor::new(data);
+                            let results = deserialize(&mut cursor)?;
+                            match results.get(0).unwrap() {
+                                Amf0Value::Utf8String(cmd) => {
+                                    match cmd.as_ref() {
+                                        "@setDataFrame" => {
+                                            let _key = results.get(1).unwrap(); //  This should always be onMetaData
+                                            let values = results.get(2).unwrap();
+                                            let mut meta = StreamMetadata::new();
+                                            meta.apply_metadata_values(values.clone().get_object_properties().unwrap());
+                                            info!("sending metadata: {:?}", meta);
+                                            let action = session.publish_metadata(&meta)?;
+                                            handle_session_results(&mut stream_writer, &mut events, vec![action]).await?;
+                                        }
+                                        _ => {
+                                            warn!("Unsupported command {}", cmd);
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    warn!("Unsupported script type: {:?}", results.get(0))
+                                }
+                            }
                         }
-                        _ => {}
                     }
                 } else {
                     info!("File is finished");

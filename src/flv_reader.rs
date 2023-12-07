@@ -45,7 +45,7 @@ where
     }
 
     pub async fn read_tag(&mut self) -> Result<(TagHeader, Vec<u8>)> {
-        let mut tag = vec![0u8; 15];
+        let mut tag = vec![0u8; 15]; // previous tag size + header size
         self.reader.read_exact(tag.as_mut_slice()).await?;
 
         // Get previous tag size
@@ -64,6 +64,6 @@ where
         // Read the rest of the tag
         tag.resize(15 + header.data_size as usize, 0u8);
         self.reader.read_exact(&mut tag[15..]).await?;
-        Ok((header, tag))
+        Ok((header, tag[15..].to_vec())) // only return tag data
     }
 }
