@@ -148,7 +148,7 @@ async fn wait_event(
 #[tokio::main]
 async fn main() -> Result<()> {
     CombinedLogger::init(vec![TermLogger::new(
-        LevelFilter::Debug,
+        LevelFilter::Info,
         Config::default(),
         TerminalMode::Mixed,
         ColorChoice::Auto,
@@ -337,7 +337,7 @@ async fn main() -> Result<()> {
         select! {
             file_read = file_rx.recv() => {
                 if let Some((duration, tag, data)) = file_read {
-                    println!("Duration: {:?} TagType: {:?}, Len {}", duration, tag.tag_type, data.len());
+                    debug!("Duration: {:?} TagType: {:?}, Len {}", duration, tag.tag_type, data.len());
                     // TODO handle timestamp wrap
                     let timestamp = RtmpTimestamp::new(duration.as_millis() as u32);
                     match tag.tag_type {
