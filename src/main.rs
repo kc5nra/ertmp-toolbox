@@ -11,11 +11,11 @@ use rml_rtmp::sessions::{
 use rml_rtmp::sessions::{PublishRequestType, StreamMetadata};
 use rml_rtmp::time::RtmpTimestamp;
 use simplelog::*;
-use std::collections::{HashMap, VecDeque};
-use std::io::Cursor;
+use std::collections::VecDeque;
+use std::io::{Cursor, SeekFrom};
 use std::time::Duration;
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::select;
 use tokio::sync::mpsc;
@@ -38,6 +38,9 @@ struct Args {
     /// Path to RTMP server
     #[arg(short, long)]
     server: String,
+
+    #[arg(short, long, default_value_t = true)]
+    _loop: bool,
 }
 
 async fn connection_reader(
@@ -66,27 +69,49 @@ async fn connection_reader(
 
 async fn read_file(
     file: &str,
+    _loop: bool,
     tags: mpsc::UnboundedSender<(Duration, TagHeader, Vec<u8>)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Open the file
-    let file = File::open(file).await?;
-
-    let mut flv_reader = FlvReader::new(file);
-    let _header = flv_reader.read_header().await;
-
     let start_time = Instant::now();
-    loop {
-        let (tag_header, tag_bytes) = flv_reader.read_tag().await?;
-        // Setup our baseline tag time
-        let current_tag_time = start_time + Duration::from_millis(tag_header.timestamp as u64);
-        let now = Instant::now();
+    let mut base_time: Duration = Duration::ZERO;
 
-        if current_tag_time > now {
-            sleep(current_tag_time - now).await;
+    'outer: loop {
+        let file = File::open(file).await?;
+        let mut flv_reader = FlvReader::new(file);
+        let _header = flv_reader.read_header().await;
+        debug!("starting file from {}", base_time.as_secs_f32());
+        // Store the most recent tag timestamp
+        let mut latest_tag_time: Duration = Duration::ZERO;
+        'inner: loop {
+            if let Ok((tag_header, tag_bytes)) = flv_reader.read_tag().await {
+                // Setup our baseline tag time
+                if tag_header.timestamp != 0 {
+                    // Checking for zero here because the last tag in the file
+                    // will have a timestamp of zero
+                    latest_tag_time = Duration::from_millis(tag_header.timestamp as u64);
+                }
+                // This represents the tag time after N loops of the file
+                let loop_adjusted_tag_time = latest_tag_time + base_time;
+                let current_tag_time = start_time + loop_adjusted_tag_time;
+                let now = Instant::now();
+
+                if current_tag_time > now {
+                    sleep(current_tag_time - now).await;
+                }
+
+                tags.send((current_tag_time - start_time, tag_header, tag_bytes))?;
+            } else {
+                debug!("File read complete");
+                if !_loop {
+                    break 'outer;
+                }
+                base_time += latest_tag_time;
+                break 'inner;
+            }
         }
-
-        tags.send((current_tag_time - start_time, tag_header, tag_bytes))?;
     }
+    Ok(())
 }
 
 // Iterate over the ClientSessionResults from a handle_input
@@ -144,7 +169,7 @@ async fn wait_event(
 #[tokio::main]
 async fn main() -> Result<()> {
     CombinedLogger::init(vec![TermLogger::new(
-        LevelFilter::Debug,
+        LevelFilter::Info,
         Config::default(),
         TerminalMode::Mixed,
         ColorChoice::Auto,
@@ -306,9 +331,11 @@ async fn main() -> Result<()> {
 
     // this new queue and task will be used to generate media tags from an FLV file
     let (file_tx, mut file_rx) = mpsc::unbounded_channel::<(Duration, TagHeader, Vec<u8>)>();
-    tokio::task::spawn(async move {
-        let _ = read_file(&args.file, file_tx).await;
+    let reader = tokio::task::spawn(async move {
+        let _ = read_file(&args.file, args._loop, file_tx).await;
     });
+
+    let mut metadata_sent = false;
 
     loop {
         select! {
@@ -333,13 +360,17 @@ async fn main() -> Result<()> {
                                 Amf0Value::Utf8String(cmd) => {
                                     match cmd.as_ref() {
                                         "@setDataFrame" => {
-                                            let _key = results.get(1).unwrap(); //  This should always be onMetaData
-                                            let values = results.get(2).unwrap();
-                                            let mut meta = StreamMetadata::new();
-                                            meta.apply_metadata_values(values.clone().get_object_properties().unwrap());
-                                            info!("sending metadata: {:?}", meta);
-                                            let action = session.publish_metadata(&meta)?;
-                                            handle_session_results(&mut stream_writer, &mut events, vec![action]).await?;
+                                            // Only forward this once, in case we're looping
+                                            if !metadata_sent {
+                                                let _key = results.get(1).unwrap(); //  This should always be onMetaData
+                                                let values = results.get(2).unwrap();
+                                                let mut meta = StreamMetadata::new();
+                                                meta.apply_metadata_values(values.clone().get_object_properties().unwrap());
+                                                info!("sending metadata: {:?}", meta);
+                                                let action = session.publish_metadata(&meta)?;
+                                                handle_session_results(&mut stream_writer, &mut events, vec![action]).await?;
+                                                metadata_sent = true;
+                                            }
                                         }
                                         _ => {
                                             warn!("Unsupported command {}", cmd);
@@ -363,12 +394,18 @@ async fn main() -> Result<()> {
                 &mut session,
                 &mut events,
             ) => {
-                info!("event received: {:?}", event);
+                debug!("event received: {:?}", event);
+            },
+            _ = tokio::signal::ctrl_c() => {
+                info!("exit signal received");
+                break;
             }
         }
     }
 
     info!("Stopping publish");
+
+    reader.abort();
 
     let results = session.stop_publishing()?;
     handle_session_results(&mut stream_writer, &mut events, results).await?;
@@ -388,7 +425,7 @@ mod test {
     async fn test_file_read() -> Result<()> {
         let (tx, mut rx) = mpsc::unbounded_channel::<(Duration, TagHeader, Vec<u8>)>();
         tokio::task::spawn(async {
-            let _ = read_file("ertmp-av1-avc-avc.flv", tx).await;
+            let _ = read_file("ertmp-av1-avc-avc.flv", false, tx).await;
         });
 
         loop {
