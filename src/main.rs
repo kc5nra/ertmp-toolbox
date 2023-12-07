@@ -3,6 +3,7 @@ use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use flavors::parser::{TagHeader, TagType};
 use log::{debug, info, warn};
+use rml_amf0::Amf0Value;
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use rml_rtmp::sessions::{
     ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult,
@@ -10,7 +11,7 @@ use rml_rtmp::sessions::{
 use rml_rtmp::sessions::{PublishRequestType, StreamMetadata};
 use rml_rtmp::time::RtmpTimestamp;
 use simplelog::*;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
@@ -25,6 +26,11 @@ use url::Url;
 use crate::flv_reader::FlvReader;
 
 mod flv_reader;
+
+const VIDEODATA_AVCVIDEOPACKET: f64 = 7.0;
+// Additional FLV onMetaData values for Enhanced RTMP/FLV
+const VIDEODATA_AV1VIDEOPACKET: f64 = 1635135537.0; // FourCC "av01"
+const VIDEODATA_HEVCVIDEOPACKET: f64 = 1752589105.0; // FourCC "hvc1"
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -218,7 +224,6 @@ async fn main() -> Result<()> {
 
     let app_name = path_parts[1].to_string();
     let mut config = ClientSessionConfig::new();
-    config.chunk_size = 8 * 65536;
 
     // let mut deserializer = ChunkDeserializer::new();
     // let mut serializer = ChunkSerializer::new();
@@ -289,7 +294,31 @@ async fn main() -> Result<()> {
     info!("publish succeeded");
 
     // send publish metadata
-    let meta = StreamMetadata::new(); // TODO is it necessary to set anything here?
+    let mut meta = StreamMetadata::new();
+    meta.apply_metadata_values(HashMap::from([
+        ("audiochannels".to_string(), Amf0Value::Number(2f64)),
+        ("audiocodecid".to_string(), Amf0Value::Number(10f64)),
+        ("audiodatarate".to_string(), Amf0Value::Number(128f64)),
+        ("audiosamplerate".to_string(), Amf0Value::Number(48000f64)),
+        ("audiosamplesize".to_string(), Amf0Value::Number(16f64)),
+        ("duration".to_string(), Amf0Value::Number(0f64)),
+        ("fileSize".to_string(), Amf0Value::Number(0f64)),
+        ("framerate".to_string(), Amf0Value::Number(30f64)),
+        ("width".to_string(), Amf0Value::Number(1920f64)),
+        ("height".to_string(), Amf0Value::Number(1080f64)),
+        ("stereo".to_string(), Amf0Value::Boolean(true)),
+        ("2.1".to_string(), Amf0Value::Boolean(false)),
+        ("3.1".to_string(), Amf0Value::Boolean(false)),
+        ("4.0".to_string(), Amf0Value::Boolean(false)),
+        ("4.1".to_string(), Amf0Value::Boolean(false)),
+        ("5.1".to_string(), Amf0Value::Boolean(false)),
+        ("7.1".to_string(), Amf0Value::Boolean(false)),
+        (
+            "videocodecid".to_string(),
+            Amf0Value::Number(VIDEODATA_AV1VIDEOPACKET),
+        ), // av1
+        ("videodatarate".to_string(), Amf0Value::Number(6000f64)), // TODO set this
+    ]));
     let action = session.publish_metadata(&meta)?;
     handle_session_results(&mut stream_writer, &mut events, vec![action]).await?;
 
