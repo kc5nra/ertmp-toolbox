@@ -3,6 +3,7 @@ use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use flavors::parser::{TagHeader, TagType};
 use log::{debug, info, warn};
+use pki_types::ServerName;
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use rml_rtmp::rml_amf0::{deserialize, Amf0Value};
 use rml_rtmp::sessions::{
@@ -12,21 +13,26 @@ use rml_rtmp::sessions::{PublishRequestType, StreamMetadata};
 use rml_rtmp::time::RtmpTimestamp;
 use simplelog::*;
 use std::collections::VecDeque;
-use std::io::{Cursor, SeekFrom};
+use std::io::Cursor;
+use std::sync::Arc;
 use std::time::Duration;
+use stream::{StreamReadHalf, StreamWriteHalf};
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::select;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::sleep;
 use tokio::time::Instant;
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+use tokio_rustls::TlsConnector;
 use url::Url;
 
 use crate::flv_reader::FlvReader;
+use crate::stream::Stream;
 
 mod flv_reader;
+mod stream;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -44,7 +50,7 @@ struct Args {
 }
 
 async fn connection_reader(
-    mut stream: ReadHalf<TcpStream>,
+    mut stream: StreamReadHalf,
     rx_queue: mpsc::UnboundedSender<Bytes>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut buffer = BytesMut::with_capacity(4096);
@@ -119,7 +125,7 @@ async fn read_file(
 // 1. send them out the RTMP connection
 // 2. put them in our local event queue for processing
 async fn handle_session_results(
-    rtmp_tx: &mut WriteHalf<TcpStream>,
+    rtmp_tx: &mut StreamWriteHalf,
     events: &mut VecDeque<ClientSessionEvent>,
     actions: impl IntoIterator<Item = ClientSessionResult>,
 ) -> Result<()> {
@@ -148,7 +154,7 @@ async fn handle_session_results(
 // for one to arrive.  This will receive data from the rtmp receiver channel
 // and route it to the session.
 async fn wait_event(
-    rtmp_tx: &mut WriteHalf<TcpStream>,
+    rtmp_tx: &mut StreamWriteHalf,
     rtmp_rx: &mut UnboundedReceiver<bytes::Bytes>,
     session: &mut ClientSession,
     events: &mut VecDeque<ClientSessionEvent>,
@@ -185,9 +191,11 @@ async fn main() -> Result<()> {
 
     info!("url: {:?}", url);
 
-    let port = url.port().unwrap_or(1935);
+    let port = url
+        .port()
+        .unwrap_or_else(|| if url.scheme().eq("rtmps") { 443 } else { 1935 });
 
-    let path_parts = url.path().split("/").collect::<Vec<&str>>();
+    let path_parts = url.path().split('/').collect::<Vec<&str>>();
     if path_parts.len() != 3 {
         return Err(anyhow!(
             "Path format is unusual. Should be /app/<stream_key>"
@@ -199,15 +207,29 @@ async fn main() -> Result<()> {
     // to 'null'
     let host = format!("{}:{}", url.host().unwrap(), port);
 
+    let domain = url
+        .domain()
+        .ok_or_else(|| anyhow!("Missing domain in server url"))?
+        .to_string();
+
     debug!("Connecting to {}", &host);
 
     // 1. Open the socket connection
-    let mut stream = TcpStream::connect(&host).await?;
+    let inter_stream = TcpStream::connect(&host).await?;
 
     // 1a Optionally handle TLS negotiation
-    if port == 443 || url.scheme().eq("rtmps") {
-        return Err(anyhow!("uh, we need to implement TLS support"));
-    }
+    let mut stream = if port == 443 || url.scheme().eq("rtmps") {
+        let mut root_cert_store = RootCertStore::empty();
+        root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = ClientConfig::builder()
+            .with_root_certificates(root_cert_store)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(config));
+        let dnsname = ServerName::try_from(domain).unwrap();
+        Stream::Tls(connector.connect(dnsname, inter_stream).await?)
+    } else {
+        Stream::Tcp(inter_stream)
+    };
 
     // 2. Send the first part of the RTMP handshake
     let mut handshake = Handshake::new(PeerType::Client);
@@ -238,7 +260,7 @@ async fn main() -> Result<()> {
     //    - this requires "splitting" the Tokio stream into read and write halves
     //    - then we can service the read task in the background to listen for
     //      commands from the server, while continuing to write tags in the foreground.
-    let (stream_reader, mut stream_writer) = tokio::io::split(stream);
+    let (stream_reader, mut stream_writer) = stream.split().await;
     let (read_bytes_sender, mut read_bytes_receiver) = mpsc::unbounded_channel();
 
     tokio::task::spawn(async { connection_reader(stream_reader, read_bytes_sender).await });
@@ -256,8 +278,6 @@ async fn main() -> Result<()> {
     );
     config.tc_url = Some(tc_url);
 
-    // let mut deserializer = ChunkDeserializer::new();
-    // let mut serializer = ChunkSerializer::new();
     let (mut session, initial_results) = ClientSession::new(config.clone())?;
 
     let mut events = VecDeque::new();
@@ -274,25 +294,21 @@ async fn main() -> Result<()> {
     handle_session_results(&mut stream_writer, &mut events, vec![connect_result]).await?;
 
     // wait for connection result
-    loop {
-        match wait_event(
-            &mut stream_writer,
-            &mut read_bytes_receiver,
-            &mut session,
-            &mut events,
-        )
-        .await?
-        {
-            ClientSessionEvent::ConnectionRequestAccepted => {
-                break;
-            }
-            ClientSessionEvent::ConnectionRequestRejected { description } => {
-                return Err(anyhow!(description));
-            }
-            ev => {
-                warn!("rtmp::client unexpected event: {:?}", ev);
-                return Err(anyhow!("Unexpected event"));
-            }
+    match wait_event(
+        &mut stream_writer,
+        &mut read_bytes_receiver,
+        &mut session,
+        &mut events,
+    )
+    .await?
+    {
+        ClientSessionEvent::ConnectionRequestAccepted => {}
+        ClientSessionEvent::ConnectionRequestRejected { description } => {
+            return Err(anyhow!(description));
+        }
+        ev => {
+            warn!("rtmp::client unexpected event: {:?}", ev);
+            return Err(anyhow!("Unexpected event"));
         }
     }
 
@@ -303,22 +319,18 @@ async fn main() -> Result<()> {
     let action = session.request_publishing(stream_key, PublishRequestType::Live)?;
     handle_session_results(&mut stream_writer, &mut events, vec![action]).await?;
 
-    loop {
-        match wait_event(
-            &mut stream_writer,
-            &mut read_bytes_receiver,
-            &mut session,
-            &mut events,
-        )
-        .await?
-        {
-            ClientSessionEvent::PublishRequestAccepted => {
-                break;
-            }
-            ev => {
-                warn!("rtmp::client unexpected event: {:?}", ev);
-                return Err(anyhow!("Unexpected event"));
-            }
+    match wait_event(
+        &mut stream_writer,
+        &mut read_bytes_receiver,
+        &mut session,
+        &mut events,
+    )
+    .await?
+    {
+        ClientSessionEvent::PublishRequestAccepted => {}
+        ev => {
+            warn!("rtmp::client unexpected event: {:?}", ev);
+            return Err(anyhow!("Unexpected event"));
         }
     }
 

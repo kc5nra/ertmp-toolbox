@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Result};
-use flavors::parser::{self as flv, tag_data, TagHeader};
-use nom::{error::ErrorKind, number::complete::be_u32, IResult};
+use flavors::parser::{self as flv, TagHeader};
+use nom::{error::ErrorKind, number::complete::be_u32};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, BufReader};
 
 pub struct FlvReader<R>
@@ -49,7 +49,7 @@ where
         self.reader.read_exact(tag.as_mut_slice()).await?;
 
         // Get previous tag size
-        let prev_tag_size = be_u32::<_, (&[u8], ErrorKind)>(&tag[..4])
+        let _prev_tag_size = be_u32::<_, (&[u8], ErrorKind)>(&tag[..4])
             .map(|(_, tag_size)| tag_size)
             .map_err(|e| anyhow!("{:#?}", e))?;
 
