@@ -338,6 +338,13 @@ async fn main() -> Result<()> {
         }
     }
 
+    info!("Stopping publish");
+
+    let results = session.stop_publishing()?;
+    handle_session_results(&mut stream_writer, &mut events, results).await?;
+
+    info!("All done!");
+
     Ok(())
 }
 
