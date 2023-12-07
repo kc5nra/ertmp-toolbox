@@ -3,8 +3,8 @@ use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use flavors::parser::{TagHeader, TagType};
 use log::{debug, info, warn};
-use rml_amf0::{deserialize, Amf0Value};
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
+use rml_rtmp::rml_amf0::{deserialize, Amf0Value};
 use rml_rtmp::sessions::{
     ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult,
 };
@@ -27,11 +27,6 @@ use url::Url;
 use crate::flv_reader::FlvReader;
 
 mod flv_reader;
-
-const VIDEODATA_AVCVIDEOPACKET: f64 = 7.0;
-// Additional FLV onMetaData values for Enhanced RTMP/FLV
-const VIDEODATA_AV1VIDEOPACKET: f64 = 1635135537.0; // FourCC "av01"
-const VIDEODATA_HEVCVIDEOPACKET: f64 = 1752589105.0; // FourCC "hvc1"
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -149,7 +144,7 @@ async fn wait_event(
 #[tokio::main]
 async fn main() -> Result<()> {
     CombinedLogger::init(vec![TermLogger::new(
-        LevelFilter::Info,
+        LevelFilter::Debug,
         Config::default(),
         TerminalMode::Mixed,
         ColorChoice::Auto,
@@ -177,7 +172,7 @@ async fn main() -> Result<()> {
     // unfortunately we can't use .origin() because
     // this is technically 'opaque' and would serialize
     // to 'null'
-    let host = format!("{}://{}:{}", url.scheme(), url.host().unwrap(), port);
+    let host = format!("{}:{}", url.host().unwrap(), port);
 
     debug!("Connecting to {}", &host);
 
@@ -225,6 +220,16 @@ async fn main() -> Result<()> {
 
     let app_name = path_parts[1].to_string();
     let mut config = ClientSessionConfig::new();
+    config.flash_version = "FMLE/3.0 (compatible; FMSc/1.0)".to_string();
+
+    let tc_url = format!(
+        "{}://{}:{}/{}",
+        url.scheme(),
+        url.host().unwrap(),
+        port,
+        app_name
+    );
+    config.tc_url = Some(tc_url);
 
     // let mut deserializer = ChunkDeserializer::new();
     // let mut serializer = ChunkSerializer::new();

@@ -228,7 +228,6 @@ dependencies = [
  "futures",
  "log",
  "nom",
- "rml_amf0",
  "rml_rtmp",
  "simplelog",
  "tokio",
