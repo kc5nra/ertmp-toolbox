@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use flavors::parser::{TagHeader, TagType};
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use pki_types::ServerName;
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use rml_rtmp::rml_amf0::{deserialize, Amf0Value};
@@ -406,7 +406,15 @@ async fn main() -> Result<()> {
                 &mut session,
                 &mut events,
             ) => {
-                debug!("event received: {:?}", event);
+                match event {
+                    Ok(_) => {
+                        debug!("event received: {:?}", event);
+                    }
+                    Err(e) => {
+                        error!("exit on error: {:?}", e);
+                        break;
+                    }
+                }
             },
             _ = tokio::signal::ctrl_c() => {
                 info!("exit signal received");
