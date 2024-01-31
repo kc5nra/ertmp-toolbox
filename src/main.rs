@@ -226,9 +226,9 @@ async fn main() -> Result<()> {
             .with_no_client_auth();
         let connector = TlsConnector::from(Arc::new(config));
         let dnsname = ServerName::try_from(domain).unwrap();
-        Stream::Tls(connector.connect(dnsname, inter_stream).await?)
+        Stream::new(connector.connect(dnsname, inter_stream).await?)
     } else {
-        Stream::Tcp(inter_stream)
+        Stream::new(inter_stream)
     };
 
     // 2. Send the first part of the RTMP handshake
@@ -239,7 +239,7 @@ async fn main() -> Result<()> {
     stream.write_all(&c0_and_c1).await?;
 
     // 3. Read the rest of the handshake from the server
-    let mut buff = [0; 4096];
+    let mut buff = BytesMut::with_capacity(4096);
     let bytes_after_handshake = loop {
         let bytes = stream.read(&mut buff).await?;
         match handshake.process_bytes(&buff[0..bytes])? {
