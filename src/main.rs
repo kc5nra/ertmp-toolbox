@@ -314,9 +314,14 @@ async fn main() -> Result<()> {
 
     info!("connection succeeded, attempting to publish...");
 
-    // request publish:
     let stream_key = path_parts[2].to_string();
-    let action = session.request_publishing(stream_key, PublishRequestType::Live)?;
+    let compound_stream_key = if let Some(query_params) = url.query() {
+        format!("{stream_key}?{query_params}")
+    } else {
+        stream_key
+    };
+
+    let action = session.request_publishing(compound_stream_key, PublishRequestType::Live)?;
     handle_session_results(&mut stream_writer, &mut events, vec![action]).await?;
 
     match wait_event(
